@@ -330,24 +330,6 @@ function sample1_theme($existing, $type, $theme, $path) {
 }
 
 /**
- * Preprocess function for sample1_bef_checkboxes.
- */
-function template_preprocess_sample1_bef_checkboxes(&$variables) {
-  $variables['children'] = Element::children($variables['element']);
-  $variables['hasSelectAllNone'] = !empty($variables['element']['#bef_select_all_none']) ? TRUE : FALSE;
-  $variables['hasSelectAllNoneNested'] = !empty($variables['element']['#bef_select_all_none_nested']) ? TRUE : FALSE;
-  _bef_preprocess_nested_elements($variables);
-}
-
-function template_preprocess_sample1_bef_fieldset(&$variables) {
-  $element = $variables['element'];
-  $variables['children'] = $element['#children'];
-  if (isset($element['#title']) && $element['#title'] !== '') {
-    $variables['legend']['title'] = ['#markup' => $element['#title']];
-  }
-}
-
-/**
  * @param $element
  * @return mixed
  */
