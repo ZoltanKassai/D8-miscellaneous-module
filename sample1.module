@@ -1,0 +1,783 @@
+<?php
+/**
+ * @file
+ * Hook implementations for the sample1 module.
+ */
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Form\FormStateInterface;
+use \Drupal\Core\Render\Element;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\Core\Url;
+use Drupal\node\NodeInterface;
+use Drupal\paragraphs\ParagraphInterface;
+use Drupal\views\ViewExecutable;
+use Drupal\views\Plugin\views\query\QueryPluginBase;
+use Drupal\user\Entity\Role;
+use Drupal\Component\Utility\Html;
+use Drupal\Component\Utility\Tags;
+use Drupal\editor\Entity\Editor;
+
+/**
+ * Implementation of hook_preprocess_field_multiple_value_form().
+ */
+function sample1_preprocess_field_multiple_value_form(&$variables) {
+  $element = $variables['element'];
+
+  // Dissallow add, delete and reorder in content paragraphs fields.
+  if ($element['#field_name'] == 'field_content_paragraph' &&
+      $element['#cardinality_multiple'] &&
+      !$variables['user']->hasPermission('manipulate paragraph pages')) {
+
+    // Remove extra columns from header.
+    unset($variables['table']['#header'][0]['colspan']);
+    unset($variables['table']['#header'][1]);
+
+    // Remove drag handle and ordering columns from rows.
+    foreach ($variables['table']['#rows'] as &$row) {
+      unset($row['data'][2]);
+      unset($row['data'][0]);
+    }
+
+    // Prevent table drag javascript attaching to this table.
+    unset($variables['table']['#tabledrag']);
+  }
+}
+
+/**
+ * Implements hook_entity_access().
+ * Checks access to entities
+ */
+function sample1_entity_access(\Drupal\Core\Entity\EntityInterface $entity, $operation, \Drupal\Core\Session\AccountInterface $account) {
+
+  if (is_object($entity) && in_array('isTranslatable', get_class_methods($entity)) && $entity->isTranslatable()) {
+
+    // This module doesn't deal with view permissions
+    if ($operation == 'view') {
+      return \Drupal\Core\Access\AccessResult::neutral();
+    }
+
+    $account = sample1_get_account($account);
+
+    if ($account->hasPermission('edit any language')) {
+      return \Drupal\Core\Access\AccessResult::neutral();
+    }
+
+    return \Drupal\Core\Access\AccessResult::forbiddenIf(
+      !sample1_has_access($entity->language()->getId(), $account)
+    );
+  }
+}
+
+/**
+ * Implements hook_publishcontent_publish_access().
+ *
+ * @param \Drupal\node\NodeInterface $node
+ * @param \Drupal\Core\Session\AccountInterface $account
+ * @return \Drupal\Core\Access\AccessResult
+ */
+function sample1_publishcontent_publish_access(NodeInterface $node, AccountInterface $account) {
+  return sample1_entity_access($node, 'update', $account);
+}
+
+/**
+ * Implements hook_publishcontent_publish_access().
+ *
+ * @param \Drupal\node\NodeInterface $node
+ * @param \Drupal\Core\Session\AccountInterface $account
+ * @return \Drupal\Core\Access\AccessResult
+ */
+function sample1_publishcontent_unpublish_access(NodeInterface $node, AccountInterface $account) {
+  return sample1_entity_access($node, 'update', $account);
+}
+
+/**
+ * Implements hook_preprocess().
+ */
+function sample1_preprocess(&$variables, $hook) {
+
+  // Process the content listing to remove operations from content versions for which the current
+  // user does not have editing ability for that language.
+  if ($hook == 'views_view_field' &&
+    !empty($variables['view']->element['#name']) &&
+      $variables['view']->element['#name'] == 'content' &&
+        get_class($variables['field']) == 'Drupal\views\Plugin\views\field\EntityOperations') {
+
+    $user = \Drupal\user\Entity\User::load(Drupal::currentUser()->id());
+
+    if ($user->hasPermission('edit any language')) {
+      return;
+    }
+
+    // Remove operations if user cannot edit the content language.
+    $allowed_langs = sample1_get_allowed_languages($user);
+    if (!in_array($variables['row']->node_field_data_langcode, $allowed_langs)) {
+      unset($variables['output']);
+    }
+    return;
+  }
+
+  // Remove languages from the language select that the user does not have editing rights for.
+  if ($hook == 'select' && isset($variables['element']['#type']) &&
+      $variables['element']['#type'] == 'language_select') {
+
+    // Override the language options if override set.
+    if (!empty($variables['element']['#sample1_options_override'])) {
+      $variables['element']['#options'] = $variables['element']['#sample1_options_override'];
+      foreach($variables['options'] as $pos => $option) {
+        if (!isset($variables['element']['#options'][$option['value']])) {
+          unset($variables['options'][$pos]);
+        }
+      }
+    }
+    else {
+      $pos = 0;
+      foreach ($variables['element']['#options'] as $code => $language) {
+        if (!sample1_has_access($code)) {
+          unset($variables['element']['#options'][$code]);
+          unset($variables['options'][$pos]);
+        }
+        $pos++;
+      }
+    }
+    return;
+  }
+
+  // Process the translation listing to remove operations from versions for which the current
+  // user does not have editing ability for that language.
+  if ($hook == 'table' && strpos(\Drupal::service('path.current')
+      ->getPath(), '/translations') !== FALSE
+    && strpos(\Drupal::service('path.current')
+      ->getPath(), '/translations/') === FALSE) {
+
+    $languages = \Drupal::languageManager()->getLanguages();
+
+    $user = \Drupal\user\Entity\User::load(Drupal::currentUser()->id());
+
+    if ($user->hasPermission('edit any language')) {
+      return;
+    }
+
+    $allowed_langs = sample1_get_allowed_languages($user);
+
+    $pos = 0;
+    foreach ($languages as $key => $language) {
+
+      $langcode = $language->getId();
+
+      if (!in_array($langcode, $allowed_langs)) {
+        $last = count($variables['rows'][$pos]['cells']) - 1;
+        $variables['rows'][$pos]['cells'][$last]['content']['#links'] = array();
+      }
+      $pos++;
+    }
+    return;
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function sample1_form_user_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+
+  $account = Drupal::currentUser();
+  if (!$account->hasPermission('set user editing languages')) {
+    $form['field_language_editing']['#disabled'] = TRUE;
+  }
+}
+
+/**
+ * Implements hook_ckeditor_css_alter().
+ */
+function sample1_ckeditor_css_alter(&$css, Editor $editor) {
+  $css[] = drupal_get_path('theme', 'vandermoortele') .  '/build/css/style.css';
+}
+
+function sample1_form_views_exposed_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+
+  // views-exposed-form-recipe-recipe-search
+
+  if ($form['#id'] == 'views-exposed-form-recipe-recipes-for-recipe-category') {
+
+    /**
+     * Insert new select control that switches between recipe categorie.
+     */
+
+    // Get the current url.
+    $currentUrl = \Drupal::request()->getRequestUri();
+
+    // Build options list for select. Category names indexed by their paths.
+    $terms = \Drupal::entityTypeManager()->getStorage('taxonomy_term')->loadTree('recipe_categories');
+    $options = [];
+    foreach ($terms as $term) {
+      $url = Drupal\Core\Url::fromRoute('entity.taxonomy_term.canonical', ['taxonomy_term' => $term->tid]);
+      $options[$url->toString()] = $term->name;
+    }
+
+    $form['category'] = [
+      '#title' => t('Select category'),
+      '#type' => 'select',
+      '#options' => $options,
+      '#size' => NULL,
+      '#default_value' => $currentUrl,
+      '#attributes' => [
+        'onchange' => "javascript:location.href = this.options[this.selectedIndex].value;",
+      ],
+    ];
+
+    // Submit when enter pressed in title search field.
+    $form['title']['#attributes'] = [
+      'onkeydown' => "javascript:if(this.keyCode == 13){ this.form.submit();}",
+    ];
+
+    // Submit on change of category.
+    $form['term_node_tid_depth']['#attributes'] = [
+      'onchange' => "javascript:this.form.submit();",
+    ];
+
+    // Submit on change of sort key field.
+    $form['sort_by']['#attributes'] = [
+      'onchange' => "javascript:this.form.submit();",
+    ];
+
+    // Submit on change of sort order.
+    $form['sort_order']['#attributes'] = [
+      'onchange' => "javascript:this.form.submit();",
+    ];
+  }
+  elseif ($form['#id'] == 'views-exposed-form-recipe-recipe-search') {
+    if (!empty($form['secondary'])) {
+      $form['secondary']['#theme'] = 'sample1_bef_secondary_exposed_elements';
+      foreach(Element::children($form['secondary']) as $child) {
+        $element =& $form['secondary'][$child];
+        $element['#theme'] = 'sample1_bef_checkboxes';
+      }
+      $form['title']['#placeholder'] = t('Type here to search');
+    }
+  }
+  elseif ($form['#id'] == 'views-exposed-form-product-search2-product-search') {
+    // Force exposed filter to be displayed.
+    $storage = $form_state->getStorage();
+
+    /** @var Drupal\views\Plugin\views\display\Page $display_handler */
+    $display_handler = $storage['view']->display_handler;
+    $display_handler->setOption('exposed_block', false);
+
+    // Get product page path and convert to localised alias to update exposed
+    // form action.
+    $system_path = Drupal::config('sample1.settings')->get('product_search_page');
+    $url = Url::fromUserInput($system_path);
+    $form['#action'] = $url->toString();
+
+    $form_state->setStorage($storage);
+
+    if (!empty($form['secondary'])) {
+      $form['secondary']['#theme'] = 'sample1_bef_secondary_exposed_elements';
+      foreach(Element::children($form['secondary']) as $child) {
+        $element =& $form['secondary'][$child];
+        $element['#theme'] = 'sample1_bef_checkboxes';
+        $element['#sample1_hierarchical'] = TRUE;
+      }
+      $form['title']['#placeholder'] = t('Type here to search');
+    }
+  }
+  elseif($form['#id'] == 'views-exposed-form-contacts-block-1'){
+    $options = $form['gid_filter']['#options'];
+    asort($options);
+    $form['gid_filter']['#options'] = $options;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function sample1_form_contact_message_contact_us_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
+
+  // There is a requirement to limit the character length of the data being
+  // saved as the company name.  As there is already data in the DB changing the
+  // current DB field length may lose data - so as a basic work-around we are
+  // limiting the number of characters which can fit into the input field..
+  $form['field_company_name']['widget'][0]['value']['#attributes']['maxlength'] = array(40);
+
+  // This make the displayed field width consistent with other fields.
+  $form['field_company_name']['widget'][0]['value']['#attributes']['size'] = array(60);
+
+  //Sort contry field alphabetically
+  $options = $form['field_country']['widget']['#options'];
+  asort($options);
+  $form['field_country']['widget']['#options'] = $options;
+  //kint($options);exit;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function sample1_theme($existing, $type, $theme, $path) {
+  return array(
+    'sample1_bef_checkboxes' => [
+      'render element' => 'element',
+    ],
+    'sample1_bef_fieldset' => [
+      'render element' => 'element',
+    ],
+    'sample1_bef_secondary_exposed_elements' => [
+      'render element' => 'element',
+    ],
+  );
+}
+
+/**
+ * Preprocess function for sample1_bef_checkboxes.
+ */
+function template_preprocess_sample1_bef_checkboxes(&$variables) {
+  $variables['children'] = Element::children($variables['element']);
+  $variables['hasSelectAllNone'] = !empty($variables['element']['#bef_select_all_none']) ? TRUE : FALSE;
+  $variables['hasSelectAllNoneNested'] = !empty($variables['element']['#bef_select_all_none_nested']) ? TRUE : FALSE;
+  _bef_preprocess_nested_elements($variables);
+}
+
+function template_preprocess_sample1_bef_fieldset(&$variables) {
+  $element = $variables['element'];
+  $variables['children'] = $element['#children'];
+  if (isset($element['#title']) && $element['#title'] !== '') {
+    $variables['legend']['title'] = ['#markup' => $element['#title']];
+  }
+}
+
+/**
+ * @param $element
+ * @return mixed
+ */
+function sample1_bef_secondary_exposed_elements_pre_render($element) {
+  $element['#theme_wrappers'] = ['sample1_bef_fieldset'];
+  return $element;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function sample1_form_search_form_alter(&$form, &$form_state) {
+  $form['help_link']['#access'] = FALSE;
+  $form['advanced']['#access'] = FALSE;
+  $form['basic']['keys']['#title'] = '';
+  $manager = \Drupal::languageManager();
+  $form['advanced']['lang-fieldset']['language']['#default_value'] = [$manager->getCurrentLanguage()->getId()];
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function sample1_form_search_block_form_alter(&$form, &$form_state) {
+  $manager = \Drupal::languageManager();
+
+  $form['advanced-form'] = [
+    '#type' => 'hidden',
+    '#value' => 1,
+  ];
+  $form['f[0]'] = [
+    '#type' => 'hidden',
+    '#value' => 'language:' . $manager->getCurrentLanguage()->getId(),
+  ];
+}
+
+/**
+ * @param $variables
+ */
+function sample1_preprocess_search_result(&$variables) {
+  if ($variables['plugin_id'] == 'node_search') {
+    /** @var \Drupal\node\Entity\Node $node */
+    $node = $variables['result']['node'];
+    if (!in_array($node->bundle(), ['product', 'recipe', 'contact', 'brand', 'article'])) {
+      unset($variables['result']['type']);
+    }
+  }
+}
+
+/**
+ * @param \Drupal\search_api\Query\ResultSetInterface $results
+ *   The results array that will be returned for the search.
+ * @param \Drupal\search_api\Query\QueryInterface $query
+ *   The SearchApiQueryInterface object representing the executed search query.
+ * @param \Solarium\QueryType\Select\Result\Result $resultset
+ *   The Solarium result object.
+ * https://www.drupal.org/project/search_api_solr/issues/2873474
+ */
+function sample1_search_api_solr_search_results_alter($result_set, $query, $result) {
+
+  $result_items = $result_set->getResultItems();
+
+  if (isset($result_items)) {
+
+    $itemcouter = 0;
+
+    // Firstly we check which nodes appears in the search result
+    foreach ($result_items as $id => &$item) {
+
+      $itemcouter ++;
+      $itemId = $item->getId();
+      $pos = strpos($itemId, 'entity:node/');
+
+      if ($pos === 0) {
+
+        $nid = substr($itemId, 12);
+        $colonpos = strpos($nid, ':');
+        $nids[$itemcouter] = substr($nid, 0, $colonpos);
+      }
+    }
+
+    // Secondly we check which nodes in the sample1_search_prevent table
+    // if there was node(s) in the search result
+    if (isset($nids)) {
+
+      $text_nids = array_values($nids);
+      $result = \Drupal::database()->select('sample1_search_prevent', 'v')
+        ->fields('v', ['url'])
+        ->condition('url', $text_nids, 'in')
+        ->execute()
+        ->fetchAllAssoc('url');
+
+      $prevent_indexed = [];
+      foreach ($result as $row => $value) {
+        $prevent_indexed[] = (string) $row;
+      }
+
+      // Thirdly we delete the affected row(s)
+      // from the search result
+      $modified_result = $result_items;
+      foreach ($result_items as $id => &$item) {
+
+        $itemId = $item->getId();
+        $nid = substr($itemId, 12);
+        $colonpos = strpos($nid, ':');
+        $nid = substr($nid, 0, $colonpos);
+
+        if (in_array($nid, $prevent_indexed)) {
+
+          unset($modified_result[$id]);
+          $result_set->setResultItems($modified_result);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function sample1_form_alter(&$form, $form_state, $form_id) {
+
+  $tempstore = \Drupal::service('user.private_tempstore')->get('sample1');
+  $tempstore->set('override_autocomplete', FALSE);
+
+  if (strpos($form_id, 'group_content_market-group_node-') !== FALSE) {
+    $tempstore->set('override_autocomplete', TRUE);
+
+    $current_uri = \Drupal::request()->getRequestUri();
+
+    if (strpos($current_uri, '3Aarticle') !== FALSE) {
+      $tempstore->set('content_type', 'article');
+    }
+    else {
+      $tempstore->set('content_type', '*');
+    }
+  }
+
+  $language = \Drupal::languageManager()->getCurrentLanguage()->getId();
+
+  if ($form_id == 'views_exposed_form' && $form['#id'] == 'views-exposed-form-acquia-search-page' && $language == 'es') {
+    $form['#submit'][] = 'sample1_acquia_search_form_submit';
+    $form['#submit'] = array_reverse($form['#submit']);
+  }
+}
+
+/**
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function sample1_acquia_search_form_submit($form, $form_state) {
+
+  $values = $form_state->getValues();
+  $search_query = strtolower($values['search']);
+  $search_query = str_replace(' de ', ' ', $search_query);
+  $form_state->setValue('search', $search_query);
+
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for node_form.
+ *
+ * @param $form
+ * @param \Drupal\Core\Form\FormStateInterface $form_state
+ */
+function sample1_form_node_form_alter(&$form, FormStateInterface $form_state) {
+
+  $form['menu']['#access'] = ($form['menu']['#access'] || \Drupal::currentUser()->hasPermission('provide node menu link'));
+  $form['status']['widget']['value']['#title'] = t('Published');
+
+  // If the prevent indexing checkbox checked
+  // we store the NID into the sample1_search_prevent table
+  $current_path = \Drupal::service('path.current')->getPath();
+
+  if (!Url::fromUri("base:" . $current_path)->isExternal()) {
+
+    $params = Url::fromUri("internal:" . $current_path)->getRouteParameters();
+    $entity_type = key($params);
+
+    if ($entity_type == 'node') {
+
+      $current_path = substr($current_path, 6);
+      $perpos = strpos($current_path, '/');
+      $nid = substr($current_path, 0, $perpos);
+
+      if ($form['field_prevent_indexing']['widget']['value']['#default_value']) {
+
+        $query = \Drupal::database()->insert('sample1_search_prevent'); // Store
+        $query->fields([
+          'url' => $nid
+        ]);
+      }
+      else {
+
+        $query = \Drupal::database()->delete('sample1_search_prevent'); // Delete
+        $query->condition('url', $nid, '=');
+      }
+
+      $query->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_access() for entity type "paragraph".
+ */
+function sample1_paragraph_access(ParagraphInterface $entity, $operation, AccountInterface $account) {
+  $permissions = &drupal_static(__FUNCTION__, array());
+
+  $field = $entity->get('parent_field_name')->value;
+
+  if ($field != 'field_content_paragraph') {
+    // Only apply to this field used by paragraph pages for now.
+    return AccessResult::neutral();
+  }
+
+  if (!in_array($operation, array('delete'), TRUE)) {
+    // If there was no type to check against, or the $op was not one of the
+    // supported ones, we return access denied.
+    return AccessResult::neutral();
+  }
+
+  // If we've already checked access for this type, user and op, return from
+  // cache.
+  if (isset($permissions[$account->id()][$field][$operation])) {
+    return $permissions[$account->id()][$field][$operation];
+  }
+
+  // If the current user has access to this type/operation, return access
+  // allowed, forbidden otherwise.
+  if ($account->hasPermission('manipulate paragraph pages') || $account->hasPermission($operation . ' paragraph content in field ' . $field)) {
+    $permissions[$account->id()][$field][$operation] = AccessResult::allowed()->cachePerPermissions();
+  }
+  else {
+    $permissions[$account->id()][$field][$operation] = AccessResult::forbidden()->cachePerPermissions();
+  }
+
+  return $permissions[$account->id()][$field][$operation];
+}
+
+/**
+ * Implements hook_language_fallback_candidates_OPERATION_alter() for
+ * 'entity_view' operation.
+ *
+ * Replaces content_translation hook for nodes with test for view_unpublished
+ * permisions.
+ */
+function sample1_language_fallback_candidates_entity_view_alter(array &$candidates, array $context) {
+  /** @var \Drupal\Core\Entity\ContentEntityInterface $entity */
+  $entity = $context['data'];
+  $entity_type_id = $entity->getEntityTypeId();
+
+  if ($entity_type_id != 'node') {
+    content_translation_language_fallback_candidates_entity_view_alter($candidates, $context);
+  }
+  else {
+    /** @var \Drupal\content_translation\ContentTranslationManagerInterface $manager */
+    $manager = \Drupal::service('content_translation.manager');
+    if ($manager->isEnabled($entity_type_id, $entity->bundle())) {
+      $entity_type = $entity->getEntityType();
+
+      $permission = $entity_type->getPermissionGranularity() == 'bundle' ? $permission = "translate {$entity->bundle()} $entity_type_id" : "translate $entity_type_id";
+      $unpublished_permission = "view any unpublished {$entity->bundle()} node";
+
+      $current_user = \Drupal::currentuser();
+      if (!$current_user->hasPermission('translate any entity') && !$current_user->hasPermission($permission) && !$current_user->hasPermission('view any unpublished content') && !$current_user->hasPermission($unpublished_permission)) {
+        foreach ($entity->getTranslationLanguages() as $langcode => $language) {
+          $metadata = $manager->getTranslationMetadata($entity->getTranslation($langcode));
+          if (!$metadata->isPublished()) {
+            unset($candidates[$langcode]);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function sample1_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'language_fallback_candidates_entity_view_alter') {
+    unset($implementations['content_translation']);
+  }
+}
+
+/**
+ * Implements hook_page_attachments().
+ */
+function sample1_page_attachments(array &$page) {
+  $tags = $page['#attached']['html_head'];
+    foreach ($page['#attached']['html_head_link'] as $key => $tag) {
+      $existing_tags[] = $tag;
+      $keys[] = $key;
+
+      if(!empty($tag[1])){
+      if($tag[1] == 'title'){
+        $title = $tag[0]['#attributes']['content'];
+      }
+      }
+    }
+    //print"<pre>";print_r($existing_tags);exit;
+    if(empty($title)){
+      $request = \Drupal::request();
+      if ($route = $request->attributes->get(\Symfony\Cmf\Component\Routing\RouteObjectInterface::ROUTE_OBJECT)) {
+        $title = \Drupal::service('title_resolver')->getTitle($request, $route);
+      }
+    }
+    $ogImage = array(
+        '#tag' => 'meta',
+        '#attributes' => array(
+            'property' => 'og:title',
+            'content' => $title,
+        ),
+    );
+    if(!in_array('og_title', $existing_tags)){
+      $page['#attached']['html_head'][] = [$ogImage, 'og_title'];
+    }
+}
+
+/**
+ * Implements hook_page_attachments_alter().
+ */
+function sample1_page_attachments_alter(&$attachments){
+  foreach ($attachments['#attached']['html_head_link'] as $key => $link) {
+    $keys[] = $link;
+    // Remove hreflang attributes from HEAD
+    if($link[0]['rel'] == "alternate") {
+      $alternate[] = $link;
+      unset($attachments['#attached']['html_head_link'][$key]);
+    }
+    if($link[0]['rel'] == "canonical") {
+      global $base_url;
+      $url = $base_url . $attachments['#attached']['html_head_link'][$key][0]['href'];
+      $attachments['#attached']['html_head_link'][$key][0]['href'] = $url;
+    }
+  }
+}
+
+/**
+ * Implements hook_config_schema_info_alter().
+ */
+function sample1_config_schema_info_alter(&$definitions) {
+  // Modify to the  EU Cookie Compliance schema.
+  $definitions['eu_cookie_compliance.settings']['mapping']['popup_link']['type']='label';
+}
+
+/**
+ * Implements hook_views_query_alter().
+ */
+function sample1_views_query_alter(ViewExecutable $view, QueryPluginBase $query) {
+
+  // Changing brands sorting by market
+  if ($view->id() == 'our_brands') {
+
+    $view_display = $view->getDisplay()->display['id'];
+
+    if ($view_display == 'default_ordering_of_brands') {
+
+      if (isset($view->exposed_data['gid_filter']) && $view->exposed_data['gid_filter'] != 'All') {
+
+        $market_filter = $view->exposed_data['gid_filter'];
+        $brand_language = 'en';
+
+        switch ($market_filter) {
+
+          case "71":
+            $brand_language = 'en-gb';
+            break;
+          case "141":
+            $brand_language = 'en';
+            break;
+        }
+
+        $query->addWhereExpression(0, "node_field_data.langcode = '$brand_language'");
+
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_transliteration_overrides_alter().
+ *
+ * Need this hook to eliminate ® (&#174;) and Ⓡ (&#9415;) from URL
+ */
+function sample1_transliteration_overrides_alter(&$overrides, $langcode) {
+
+  $overrides[174] = '';
+  $overrides[9415] = '';
+
+}
+
+/**
+ * Get the set of languages a user id allowed to edit.
+ *
+ * @param \Drupal\user\Entity\User $user
+ * @return array
+ */
+function sample1_get_allowed_languages(\Drupal\user\Entity\User $user) {
+    $languages = $user->get('field_language_editing')->getValue();
+
+    $allowed = array();
+
+    foreach ($languages as $language) {
+        $allowed[] = $language['target_id'];
+    }
+
+    return $allowed;
+}
+
+function sample1_has_access($langcode, \Drupal\Core\Session\AccountInterface $account = NULL) {
+
+    $account = sample1_get_account($account);
+
+    // Bypass language editing restictions for roles with the right permission.
+    if ($account->hasPermission('edit any language')) {
+        return TRUE;
+    }
+
+    // Get the allowed languages from the user entity.
+    $user = \Drupal\user\Entity\User::load($account->id());
+    $allowed = sample1_get_allowed_languages($user);
+
+    // Return true if language is availalbe for this user.
+    $access = in_array($langcode, $allowed);
+    return $access;
+}
+
+function sample1_get_account(\Drupal\Core\Session\AccountInterface $account = null) {
+
+    // If no user object is supplied, the access check is for the current user.
+    if (empty($account)) {
+        $account = Drupal::currentUser();
+    }
+    return $account;
+}
