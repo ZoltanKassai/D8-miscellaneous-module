@@ -193,6 +193,9 @@ function sample1_ckeditor_css_alter(&$css, Editor $editor) {
   $css[] = drupal_get_path('theme', 'vandermoortele') .  '/build/css/style.css';
 }
 
+/**
+ * Implements hook_form_views_exposed_form_alter().
+ */
 function sample1_form_views_exposed_form_alter(&$form, \Drupal\Core\Form\FormStateInterface $form_state, $form_id) {
 
   // views-exposed-form-recipe-recipe-search
